@@ -1,5 +1,5 @@
 {
-  "name": "yrzhe-skills",
+  "name": "lvkate-skills-dev",
   "owner": {
     "name": "yrzhe",
     "url": "https://x.com/yrzhe_top"
@@ -7,7 +7,7 @@
   "metadata": {
     "description": "A collection of powerful Claude Code skills by yrzhe. Includes intelligent web scraping, automation, and productivity tools.",
     "version": "1.0.0",
-    "homepage": "https://github.com/yrzhe/claude-skills"
+    "homepage": "https://github.com/lvkate/Yrzhe-claude-skills"
   },
   "plugins": [
     {
@@ -376,12 +376,12 @@
     {
       "name": "translate-view",
       "description": "Translate outgoing prompts and stream reply translations into a side pane with configurable LLM and Jev detection.",
-      "version": "0.1.10",
+      "version": "0.1.10-dev.12",
       "author": {
         "name": "yrzhe",
         "url": "https://x.com/yrzhe_top"
       },
-      "repository": "https://github.com/Yrzhe/claude-skills",
+      "repository": "https://github.com/lvkate/Yrzhe-claude-skills",
       "license": "MIT",
       "source": "./plugins/translate-view",
       "tags": [

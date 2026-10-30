@@ -1101,6 +1101,55 @@ test('a 22-column full-input inspector keeps navigation on separate header rows'
   expect(await ui.find({ key: 'input-full-header' })).toBeUndefined()
 })
 
+test('reply diagnostic ownership waits for host acceptance and malformed output retains evidence', async ($, on) => {
+  const calls: any[] = []
+  const clock = setup(on, { ...CONFIG, diagnosticsMode: 'failures' } as typeof CONFIG, request => {
+    calls.push(request)
+    if (request.action === 'diagnostic-control') return { ok: true }
+  })
+  let request: any
+  let broken = false
+  on('process.spawn', async function* ($, e) {
+    if (broken) { yield { stream: 'stdout', text: 'invalid json\n' } as const; return { value: { code: 0, signal: null } } }
+    request = JSON.parse(e.input ?? '{}')
+    yield { stream: 'stdout', text: JSON.stringify({ type: 'done', text: '译文', diagnostic: { saved: true, id: request.diagnostic?.id } }) + '\n' } as const
+    return { value: { code: 0, signal: null } }
+  })
+  await $.session.start(start)
+  await $.turn.start({ text: 'hello', turnId: 't' })
+  await $.turn.complete(done('Original answer.'))
+  await clock.advance(250)
+  expect(request.diagnostic?.cursor).toBe(0)
+  expect(request.diagnostic?.end).toBe(16)
+  expect(request.diagnostic?.managed).toBe(true)
+  expect(request.diagnostic?.epoch).toBe('0')
+  expect(calls.some(call => call.operation === 'prepare' && call.epoch === '0')).toBe(true)
+  expect(calls.some(call => call.operation === 'confirm' && call.id === request.diagnostic.id)).toBe(true)
+  broken = true
+  await $.turn.start({ text: 'next', turnId: 'u' })
+  await $.turn.complete(done('Another answer.', 'u'))
+  await clock.advance(250)
+  expect(calls.some(call => call.operation === 'fail' && call.detail?.category === 'host_output')).toBe(true)
+})
+
+test('diagnostic settings opt in explicitly and clear through a local helper action', async ($, on) => {
+  const calls: any[] = []
+  setup(on, CONFIG, request => {
+    calls.push(request)
+    if (request.action === 'diagnostic-control') return { ok: true, cleared: 2 }
+  })
+  await $.session.start(start)
+  await $.command.run({ ...translateCommand, args: 'settings' })
+  const ui = await $.ui.mount(PANE)
+  expect((await ui.find({ key: 'diagnosticsMode' }))?.props.value).toBe('off')
+  await ui.select({ key: 'diagnosticsMode', value: 'failures' })
+  await ui.press({ key: 'save-settings' })
+  expect(calls.find(call => call.action === 'save')?.patch.diagnosticsMode).toBe('failures')
+  await $.command.run({ ...translateCommand, args: 'settings' })
+  await ui.press({ key: 'clear-diagnostics' })
+  expect(calls.some(call => call.action === 'diagnostic-control' && call.operation === 'clear')).toBe(true)
+})
+
 for (const [columns, rows] of [[60, 2], [60, 1], [22, 2]] as const) {
   test(`full-input navigation remains usable in a ${columns}x${rows} body`, async ($, on) => {
     setup(on, { ...CONFIG, inputTranslation: 'left', inputLeft: 'both', inputRight: 'off' })

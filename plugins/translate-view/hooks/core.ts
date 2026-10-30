@@ -1,6 +1,7 @@
 import { responsiveTables } from './tables'
 
 export type Config = {
+  diagnosticsMode?: 'off' | 'failures'; diagnosticsEpoch?: string;
   configPath?: string; keyInfo?: Record<string, { active: string; saved: string }>;
   sources?: Record<string, string>; envStatus?: Record<string, boolean>; effectiveJevModel?: string;
   jevConfigSource?: string; jevUrlEnv?: string; jevModelEnv?: string;

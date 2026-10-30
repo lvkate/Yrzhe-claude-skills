@@ -38,6 +38,41 @@ let originals = new Map<string, { original: string }[]>()
 let failedPrompts: string[] = []
 let job: { source: string; cursor: number; done: boolean; pieces: string[]; pending: string; error: string; skipped: boolean } | undefined
 
+type DiagnosticContext = { id: string; token: string; managed: true; prepared?: boolean; epoch: string; session: string; direction: string; turn: string; generation: number; cursor: number; end: number; done: boolean; sequence: number }
+const diagnosticOperations = new Map<string, { context: DiagnosticContext; touched: number }>()
+let diagnosticSession = ''
+let diagnosticSequence = 0
+function diagnosticId() { return Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16)).join('') }
+function diagnosticSuffix(value: any) {
+  if (!value?.enabled && !value?.id) return ''
+  return value.saved && /^[a-f0-9]{32}$/.test(value.id || '') ? ' · 诊断编号 ' + value.id : ' · 诊断未保存'
+}
+async function diagnosticControl($: EngineInterface, context: DiagnosticContext, operation: string, detail?: object): Promise<boolean> {
+  try {
+    const result = await $.process.run(['python3', $.plugin.root + '/scripts/translate.py'], {
+      stdin: JSON.stringify({ ...context, action: 'diagnostic-control', operation, detail }),
+      timeoutMs: 5000,
+    })
+    if (result.exitCode !== 0 || result.isStdoutTruncated) return false
+    const value = JSON.parse(result.stdout)
+    if (operation === 'prepare' && typeof value.epoch === 'string' && cfg) cfg.diagnosticsEpoch = value.epoch
+    return value.ok === true
+  } catch { return false }
+  finally { if (operation === 'confirm' || operation === 'fail' || operation === 'cancel') diagnosticOperations.delete(context.id) }
+}
+async function beginDiagnostic($: EngineInterface, direction: string, text: string, cursor = 0, done = true): Promise<DiagnosticContext | undefined> {
+  if (cfg?.diagnosticsMode !== 'failures') return
+  const context: DiagnosticContext = { id: diagnosticId(), token: diagnosticId(), managed: true, epoch: cfg.diagnosticsEpoch || '0', session: diagnosticSession, direction, turn: activeTurn, generation, cursor, end: cursor + text.length, done, sequence: ++diagnosticSequence }
+  diagnosticOperations.set(context.id, { context, touched: Date.now() })
+  await diagnosticControl($, context, 'prepare')
+  context.prepared = true
+  return context
+}
+function cancelDiagnostics($: EngineInterface, direction: string) {
+  for (const { context } of diagnosticOperations.values())
+    if (context.direction === direction) void diagnosticControl($, context, 'cancel')
+}
+
 function redraw($: EngineInterface, deferred = false) {
   // Subscribe only the pane: a translation update must not redraw every user
   // message in a long transcript. Coalesce token bursts into at most 10 fps.
@@ -63,7 +98,8 @@ function renderedMarkdown(source: string, columns: number, section: 'reply' | 'i
   return cache.parts
 }
 /** Clear recent input and invalidate pending submissions captured before this reset. */
-function clearInput() {
+function clearInput($: EngineInterface) {
+  cancelDiagnostics($, 'incoming')
   inputEpoch++
   inputNote = undefined
   overflowInputs.clear()
@@ -74,7 +110,8 @@ function clearInput() {
   originalMarkdownCache = undefined
 }
 /** Cancel the current reply translation and reset its paging and follow state. */
-function reset(source = '', done = false) {
+function reset($: EngineInterface, source = '', done = false) {
+  cancelDiagnostics($, 'outgoing')
   generation++
   const stream = currentStream
   currentStream = undefined
@@ -92,19 +129,33 @@ async function recover($: EngineInterface, text: string) {
   }
   failedPrompts.push(text)
 }
-async function helper($: EngineInterface, data: object): Promise<Record<string, any>> {
-  const result = await $.process.run(['python3', `${$.plugin.root}/scripts/translate.py`], { stdin: JSON.stringify(data), timeoutMs: 550000 })
-  if (result.isStdoutTruncated) throw new Error('译文过长，请将内容放入文件或分次发送；原文未发送。')
-  let value
-  try { value = JSON.parse(result.stdout) } catch { throw new Error('翻译服务未返回有效结果。') }
-  if (result.exitCode !== 0 || value.error) throw new Error(value.error || '翻译失败。')
-  return value
+async function helper($: EngineInterface, data: { action?: string; direction?: string; text?: string; [key: string]: any }): Promise<Record<string, any>> {
+  const context = data.action === 'translate' ? await beginDiagnostic($, data.direction || 'incoming', data.text || '') : undefined
+  let raw = '', suffix = ''
+  try {
+    const result = await $.process.run(['python3', $.plugin.root + '/scripts/translate.py'], { stdin: JSON.stringify({ ...data, ...(context ? { diagnostic: context } : {}) }), timeoutMs: 550000 })
+    raw = result.stdout
+    if (result.isStdoutTruncated) throw new Error('译文过长，请将内容放入文件或分次发送；原文未发送。')
+    let value
+    try { value = JSON.parse(raw) } catch { throw new Error('翻译服务未返回有效结果。') }
+    suffix = diagnosticSuffix(value.diagnostic)
+    if (result.exitCode !== 0 || value.error) throw new Error(value.error || '翻译失败。')
+    if (data.action === 'translate' && (typeof value.text !== 'string' || !value.text.trim())) throw new Error('未收到有效译文。')
+    if (context) await diagnosticControl($, context, 'confirm')
+    return value
+  } catch (error) {
+    if (context) {
+      const saved = await diagnosticControl($, context, 'fail', { category: 'host_output', buffer: raw.slice(0, 64000), truncated: raw.length > 64000, generation, sourceLength: data.text?.length || 0 })
+      if (!suffix) suffix = diagnosticSuffix({ enabled: true, id: context.id, saved })
+    }
+    throw new Error((error instanceof Error ? error.message : '翻译失败。') + suffix)
+  }
 }
 /** Apply settings and publish effective display options, suspending custom display while disabled. */
 async function configure($: EngineInterface, value: Config) {
   if (cfg?.inputRight !== value.inputRight) inputPage = 0
   cfg = value
-  if (!cfg.enabled) clearInput()
+  if (!cfg.enabled) clearInput($)
   const position = value.enabled ? value.inputTranslation : 'off'
   await update($, inputDisplay, previous =>
     previous.inputTranslation === position && previous.inputLeft === value.inputLeft
@@ -130,7 +181,7 @@ async function save($: EngineInterface, patch: Record<string, unknown>, close = 
     await configure($, await helper($, { action: 'save', patch }) as Config)
     draft = { ...cfg }; notice = '已保存'; if (close) page = ''
     const source = job?.source ?? ''; const done = job?.done ?? true
-    reset(source, done)
+    reset($, source, done)
   } catch (e) { notice = e instanceof Error ? e.message : '保存失败。' }
   redraw($)
 }
@@ -141,38 +192,49 @@ async function pump($: EngineInterface) {
   if (!segment) return
   busy = true
   const token = generation, target = job
-  let buffer = '', final: { text: string; skipped?: boolean } | undefined
+  let rawLength = 0
+  let processCode: number | null = null
+  let buffer = '', raw = '', final: { text: string; skipped?: boolean; diagnostic?: any } | undefined
+  let diagnostic: any
+  const context = await beginDiagnostic($, 'outgoing', segment, target.cursor, target.done)
   try {
-    const stream = $.process.spawn({ argv: ['python3', `${$.plugin.root}/scripts/translate.py`], input: JSON.stringify({ action: 'stream', direction: 'outgoing', text: segment }) })
+    const stream = $.process.spawn({ argv: ['python3', `${$.plugin.root}/scripts/translate.py`], input: JSON.stringify({ action: 'stream', direction: 'outgoing', text: segment, ...(context ? { diagnostic: context } : {}) }) })
     currentStream = stream
     for await (const chunk of stream) {
       if (token !== generation) break
       if (chunk.stream !== 'stdout') continue
       buffer += chunk.text
+      rawLength += chunk.text.length
+      raw = (raw + chunk.text).slice(-64000)
       if (buffer.length > 2_000_000) throw new Error('译文过长。')
       let at: number
       while ((at = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, at); buffer = buffer.slice(at + 1)
         if (!line.trim()) continue
-        const data = JSON.parse(line)
+        let data
+        try { data = JSON.parse(line); if (!data || typeof data !== 'object') throw new Error() } catch { throw new Error('翻译服务未返回有效流式结果。') }
+        if (data.diagnostic) diagnostic = data.diagnostic
         if (data.type === 'error') throw new Error(data.error)
         if (data.type === 'partial' && typeof data.text === 'string') target.pending = data.text
         if (data.type === 'done' && typeof data.text === 'string') final = data
       }
       redraw($, true)
     }
-    if (token !== generation) return
+    if (token !== generation) { if (context) await diagnosticControl($, context, 'cancel'); return }
     const result = await stream.result
+    processCode = result.code
     if (result.code !== 0 || !final) throw new Error('翻译流未完成，请重试。')
     if ((final as { disabled?: boolean }).disabled) {
       if (cfg) await configure($, { ...cfg, enabled: false })
-      else clearInput()
-      reset(); notice = '翻译已在其他会话关闭'; return
+      else clearInput($)
+      reset($); notice = '翻译已在其他会话关闭'; return
     }
     target.pieces.push(final.text); target.pending = ''; target.cursor += segment.length
     target.skipped = target.skipped && final.skipped === true
+    if (context) await diagnosticControl($, context, 'confirm')
   } catch (e) {
-    if (token === generation) { target.pending = ''; target.error = e instanceof Error ? e.message : '翻译失败。' }
+    const saved = context ? await diagnosticControl($, context, token === generation ? 'fail' : 'cancel', { category: 'host_output', buffer: raw, truncated: rawLength > 64000, exitCode: processCode, cursor: target.cursor, pendingChars: target.pending.length, generation: token, currentGeneration: generation, sourceLength: target.source.length }) : false
+    if (token === generation) { target.pending = ''; target.error = (e instanceof Error ? e.message : '翻译失败。') + diagnosticSuffix(diagnostic || (context ? { enabled: true, id: context.id, saved } : undefined)) }
   } finally {
     currentStream = undefined; busy = false; redraw($)
   }
@@ -181,6 +243,7 @@ async function pump($: EngineInterface) {
 /** Register prompt translation, original-message pairing, pane rendering, and session cleanup hooks. */
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    diagnosticSession = diagnosticId(); diagnosticSequence = 0
     interactive = e.isInteractive && e.surface === 'terminal'
     await $.command.register({ name: 'translate', description: 'Open translation pane or settings', argumentHint: '[settings|on|off|input <message-id>]', immediate: true })
     try { await load($) } catch (e) { notice = e instanceof Error ? e.message : '配置读取失败。' }
@@ -188,6 +251,12 @@ export const register: Register = on => {
     $.clock.every(250, async () => {
       // Waiting for the entire stream here stalled scrolling until it finished.
       void pump($)
+      for (const operation of diagnosticOperations.values()) {
+        if (Date.now() - operation.touched >= 30000) {
+          operation.touched = Date.now()
+          void diagnosticControl($, operation.context, 'touch')
+        }
+      }
       if (interactive && (page === 'settings' || page === 'input') && settingsStart) {
         const result = await $.ui.scroll({ in: PANE, to: 'start' }).catch(() => ({ deny: 'pane unavailable' }))
         if (!result.deny) { settingsStart = false; redraw($) }
@@ -218,8 +287,8 @@ export const register: Register = on => {
     await open($, e.args.trim() === 'settings')
     return { text: cfg?.enabled ? `翻译已开启 · Agent 接收 ${cfg.incomingLanguage} · 我的阅读 ${cfg.outgoingLanguage}` : '翻译已关闭；可在设置中开启。' }
   })
-  on('session.end', ($, e, next) => { reset(); clearInput(); originals.clear(); cancelRedraw?.cancel(); cancelRedraw = undefined; markdownCache = undefined; return next(e) })
-  on('classic.SessionStart', { source: 'clear' }, async ($, e, next) => { reset(); clearInput(); originals.clear(); failedPrompts = []; await update($, displayOriginals, () => ({})); redraw($); return next(e) })
+  on('session.end', ($, e, next) => { reset($); clearInput($); originals.clear(); cancelRedraw?.cancel(); cancelRedraw = undefined; markdownCache = undefined; return next(e) })
+  on('classic.SessionStart', { source: 'clear' }, async ($, e, next) => { reset($); clearInput($); originals.clear(); failedPrompts = []; await update($, displayOriginals, () => ({})); redraw($); return next(e) })
   on('prompt.submit', async ($, e, next) => {
     if (!['composer', 'bridge', 'sdk'].includes(e.origin.kind) || !e.text.trim() || isControlPrompt(e.text)) return next(e)
     let pending: { original: string } | undefined
@@ -230,9 +299,9 @@ export const register: Register = on => {
       // Every session shares the private config. Read it before deciding whether
       // to intercept: another window may have enabled or disabled translation.
       await load($)
-      if (!cfg?.enabled) { reset(); notice = ''; redraw($); return next(e) }
+      if (!cfg?.enabled) { reset($); notice = ''; redraw($); return next(e) }
       const translated = await helper($, { action: 'translate', direction: 'incoming', text: e.text })
-      if (translated.disabled) { await configure($, { ...cfg, enabled: false }); reset(); redraw($) }
+      if (translated.disabled) { await configure($, { ...cfg, enabled: false }); reset($); redraw($) }
       if (typeof translated.text !== 'string' || !translated.text.trim()) throw new Error('未收到有效译文。')
       if (translated.text !== e.text) {
         pending = { original: e.text }; pendingKey = translated.text
@@ -302,14 +371,14 @@ export const register: Register = on => {
     }
     return next({ ...e, props: { ...e.props, text } })
   })
-  on('turn.start', ($, e, next) => { activeTurn = e.turnId; reset(); notice = ''; redraw($); return next(e) })
+  on('turn.start', ($, e, next) => { activeTurn = e.turnId; reset($); notice = ''; redraw($); return next(e) })
   on('turn.step', async function* ($, e, next) {
     if (e.agentId || !interactive || !cfg?.enabled) return yield* next(e)
     const stream = next(e)
     let source = '', began = false
     for await (const chunk of stream) {
       if (chunk.kind === 'text' && e.turnId === activeTurn) {
-        if (!began) { reset(); began = true }
+        if (!began) { reset($); began = true }
         source += chunk.text
         if (job) job.source = source
         if (source === chunk.text) redraw($)
@@ -318,7 +387,7 @@ export const register: Register = on => {
     }
     const result = await stream.result
     if (e.turnId === activeTurn && result.answer) {
-      if (job?.source !== result.answer) reset(result.answer, result.stopReason === 'end_turn')
+      if (job?.source !== result.answer) reset($, result.answer, result.stopReason === 'end_turn')
       else if (job) job.done = result.stopReason === 'end_turn'
       redraw($)
     }
@@ -326,8 +395,8 @@ export const register: Register = on => {
   })
   on('turn.complete', ($, e, next) => {
     if (!e.agentId && interactive && e.turnId === activeTurn) {
-      if (e.isAborted) { reset(); notice = '本轮已停止'; }
-      else if (job?.source !== e.answer) reset(e.answer, true)
+      if (e.isAborted) { reset($); notice = '本轮已停止'; }
+      else if (job?.source !== e.answer) reset($, e.answer, true)
       else if (job) job.done = true
       redraw($)
     }
@@ -415,6 +484,16 @@ export const register: Register = on => {
         <Select key="outgoingLanguage" label="我的阅读" value={String(draft.outgoingLanguage)} options={languageOptions(String(draft.outgoingLanguage))} onSelect={value => { set('outgoingLanguage', value); redraw($) }} />
         {field('incomingLanguage', '自定义接收代码', 'en / zh / ja')}
         {field('outgoingLanguage', '自定义阅读代码', 'en / zh / ja')}
+        <Select key="diagnosticsMode" label="失败诊断" value={String(draft.diagnosticsMode || 'off')} options={[{ value: 'off', label: '关闭' }, { value: 'failures', label: '本机保存失败正文' }]} onSelect={value => { set('diagnosticsMode', value); redraw($) }} />
+        <Text color="text" dimColor>启用后临时写入请求与响应，成功接收后删除，失败保留在本机。不自动上传；正文可能含私有信息。最多 20 条、7 天、合计 50 MiB；清理在插件运行时执行。</Text>
+        <Button key="clear-diagnostics" plain label="清除本机诊断记录" onPress={async () => {
+          try {
+            const result = await helper($, { action: 'diagnostic-control', operation: 'clear' })
+            if (cfg && typeof result.epoch === 'string') cfg.diagnosticsEpoch = result.epoch
+            notice = result.ok ? '已清除本机诊断记录' : '清除诊断失败'
+          } catch { notice = '清除诊断失败' }
+          redraw($)
+        }} />
         <Select key="detection" label="语言检测" value={String(draft.detection)} options={[{ value: 'script', label: '本地脚本' }, { value: 'llm', label: 'LLM（如 Gemini）' }, { value: 'jev', label: 'Jev' }]} onSelect={value => { set('detection', value); redraw($) }} />
         {draft.detection === 'llm' && field('detectionModel', '检测模型', '留空复用翻译模型；也可填写 Gemini 型号')}
         <Text color="text" dimColor>脚本在本机判断，无检测接口等待。LLM 检测使用「模型接口」的地址和密钥，检测模型可以单独填写；Jev 有独立接口。</Text>
@@ -572,7 +651,7 @@ export const register: Register = on => {
             if (result.isFilled) failedPrompts = []
             redraw($)
           }}><Text color={headerColors.text}>恢复输入</Text></Button>}
-          <Button key="retry" plain label={job?.error ? '重试' : narrowPane ? '底部' : '回到底部'} onPress={() => { if (job?.error) reset(job.source, job.done); follow = true; needsFollow = true; redraw($) }}><Text color={headerColors.text}>{job?.error ? '重试' : narrowPane ? '底部' : '回到底部'}</Text></Button>
+          <Button key="retry" plain label={job?.error ? '重试' : narrowPane ? '底部' : '回到底部'} onPress={() => { if (job?.error) reset($, job.source, job.done); follow = true; needsFollow = true; redraw($) }}><Text color={headerColors.text}>{job?.error ? '重试' : narrowPane ? '底部' : '回到底部'}</Text></Button>
         </Box>
         {recoveryRow && <Button key="recover-input" plain label="恢复输入" onPress={async () => {
           const current = await $.prompt.read()
